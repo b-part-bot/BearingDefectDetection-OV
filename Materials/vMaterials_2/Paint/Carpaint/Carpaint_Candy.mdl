@@ -1,0 +1,898 @@
+/******************************************************************************
+ *	        Copyright 2023 NVIDIA Corporation. All rights reserved.           *
+ ******************************************************************************
+ 
+Permission is hereby granted by NVIDIA Corporation ("NVIDIA"), free of charge,
+to any person obtaining a copy of the sample definition code that uses our 
+Material Definition Language (the "MDL Materials"), to reproduce and distribute
+the MDL Materials, including without limitation the rights to use, copy, merge,
+publish, distribute, and sell modified and unmodified copies of the MDL 
+Materials, and to permit persons to whom the MDL Materials is furnished to do
+so, in all cases solely for use with NVIDIA's Material Definition Language,
+subject to the following further conditions:
+
+1. The above copyright notices, this list of conditions, and the disclaimer
+that follows shall be retained in all copies of one or more of the MDL
+Materials, including in any software with which the MDL Materials are bundled,
+redistributed, and/or sold, and included either as stand-alone text files,
+human-readable headers or in the appropriate machine-readable metadata fields
+within text or binary files as long as those fields can be easily viewed by the
+user, as applicable.
+2. The name of NVIDIA shall not be used to promote, endorse or advertise any 
+Modified Version without specific prior written permission, except a) to comply
+ with the notice requirements otherwise contained herein; or b) to acknowledge
+the contribution(s) of NVIDIA.
+
+THE MDL MATERIALS ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING BUT NOT LIMITED TO ANY WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF COPYRIGHT, PATENT,
+TRADEMARK, OR OTHER RIGHT. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE FOR 
+ANY CLAIM, DAMAGES OR OTHER LIABILITY, INCLUDING ANY GENERAL, SPECIAL, 
+INDIRECT, INCIDENTAL, OR CONSEQUENTIAL DAMAGES, WHETHER IN AN ACTION OF 
+CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF THE USE OR INABILITY TO USE
+THE MDL MATERIALS OR FROM OTHER DEALINGS IN THE MDL MATERIALS.
+*/
+
+mdl 1.6;
+import ::df::*;
+import ::math::*;
+import ::anno::*;
+import ::state::*;
+import ::base::*;
+import ::tex::*;
+import ::nvidia::core_definitions::dimension;
+import ::nvidia::core_definitions::blend_colors;
+
+
+const string COPYRIGHT = 
+" Copyright 2023 NVIDIA Corporation. All rights reserved.\n"
+" MDL MATERIALS ARE PROVIDED PURSUANT TO AN END USER LICENSE  AGREEMENT,\n"
+" WHICH WAS ACCEPTED IN ORDER TO GAIN ACCESS TO THIS FILE.  IN PARTICULAR,\n" 
+" THE MDL MATERIALS ARE PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND,\n"
+" EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO ANY WARRANTIES OF\n"
+" MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF\n" 
+" COPYRIGHT, PATENT, TRADEMARK, OR OTHER RIGHT. IN NO EVENT SHALL NVIDIA\n"
+" CORPORATION BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, INCLUDING ANY\n"
+" GENERAL, SPECIAL,  INDIRECT, INCIDENTAL, OR CONSEQUENTIAL DAMAGES, WHETHER IN\n"
+" AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF THE USE OR\n"
+" INABILITY TO USE THE MDL MATERIALS OR FROM OTHER DEALINGS IN THE MDL MATERIALS.\n";
+
+
+::base::texture_coordinate_info transform_coordinate_2(
+	float4x4 transform										 
+		[[ ::anno::description("A transformation to be applied to the source coordinates. rotation_translation_scale() is a suggested means to compute the transformation matrix") ]],
+	::base::texture_coordinate_info coordinate = ::base::texture_coordinate_info()
+		[[ ::anno::description("Coordinate, typically sourced from coordinate_source or coordinate_projection") ]]
+) [[ 
+	::anno::description("Transform a texture coordinate by a matrix") ,
+	::anno::noinline()
+  ]]
+{
+	// Version 2
+	float4 r_position = transform * float4(coordinate.position.x,coordinate.position.y,coordinate.position.z,1);
+	//Try aproximating it for the case that the rotation is only aroud z and assuming the texture layout is nice and z is ~constant.
+	//just pretend there is no other rotation happening
+	//get rid of scaling and translation. Then extract fields where sin and cos would be in a simple 2d transform around z.
+	float4 u = transform[0];
+	float3 ru = ::math::normalize(float3(u.x,u.y,u.z));
+	float cos =  ru.x; 
+	float sin =  -ru.y;
+	
+	return ::base::texture_coordinate_info(
+		float3(r_position.x,r_position.y,r_position.z),
+		::math::normalize(cos * coordinate.tangent_u - sin * coordinate.tangent_v),
+		::math::normalize(cos * coordinate.tangent_v + sin * coordinate.tangent_u));
+}
+
+// Takes the standard input that every material has. It combines a couple of
+// functions in one convenience function.
+::base::texture_coordinate_info vmat_transform(
+								float2 translation = float2(0.0f, 0.0f),
+								float rotation	 = 0.0f,				// rotation in degrees
+								float2 scaling	 = float2(1.0f, 1.0f),
+								uniform ::base::texture_coordinate_system system = ::base::texture_coordinate_uvw,
+								uniform int uv_space	   = 0
+)
+{
+	float rotation_rad = (rotation * 3.1415926535897932384626433832f) / 180.f;
+	float4x4 scale =
+	float4x4(1.0f /scaling.x, 0.f			 ,  0.f ,	 0.f,
+			 0.f			, 1.0f /scaling.y ,  0.f ,	 0.f,
+			 0.f			, 0.f			 ,  1.0f,	 0.f,
+			 translation.x , translation.y  ,  0.0f,	 1.f);
+
+	float s = ::math::sin(rotation_rad);
+	float c = ::math::cos(rotation_rad);
+	float4x4 rotate =
+	float4x4(  c  ,  -s   , 0.0f , 0.0f,
+			   s  ,   c   , 0.0f , 0.0f,
+			   0.0f,   0.0f , 1.0f , 0.0f,
+			   0.f ,   0.0f , 0.0f , 1.f);
+	
+	return transform_coordinate_2(scale*rotate, ::base::coordinate_source(system, uv_space));
+}
+
+
+
+float histogram_range(float input, float range = 1.0f, float position = 0.5f)
+{	
+	float low = ::math::clamp(1.0f - ::math::min(((1.0f - position) + range * 0.5f), (1.0f - position) * 2), 0.0f, 1.0f);
+	float high = ::math::clamp(::math::min((position + range * 0.5f ), position * 2.0f), 0.0f, 1.0f);
+	return ::math::lerp(low, high, input);
+}
+
+//
+// flake noise utilities
+//
+int hash(int seed, int i)
+{
+	return (i ^ seed) * 1075385539;
+}
+int rnd_init(int3 pos)
+{
+	return hash(hash(hash(0, pos.x), pos.y), pos.z);
+}
+
+int rnd_next(int seed) {
+	// xorshift32 using signed int
+	seed ^= seed << 13;
+	seed ^= seed >>> 17;
+	seed ^= seed << 5;
+	return seed;
+}
+
+float rnd_value(int seed)
+{
+	//return ::math::abs(float(seed) * 4.6566fe-10f);
+	return ::math::abs(float(seed) * 0.00000000046566f);
+}
+
+// apply random rotation (using "Fast Random Rotation Matrices" by James Arvo)
+float3 rotate_pos(float3 pos, float3 xi)
+{
+	float theta = ::math::PI * 2.0f * xi.x;
+	float phi = ::math::PI * 2.0f * xi.y;
+	float z = xi.z * 2.0f;
+
+	float r = ::math::sqrt(z);
+	float[2] sp_cp = ::math::sincos(phi);
+	float Vx = sp_cp[0] * r;
+	float Vy = sp_cp[1] * r;
+	float Vz = ::math::sqrt(2.0f - z);
+
+	float[2] st_ct = ::math::sincos(theta);
+	float Sx = Vx * st_ct[1] - Vy * st_ct[0];
+	float Sy = Vx * st_ct[0] + Vy * st_ct[1];
+
+	float3x3 M(
+		Vx * Sx - st_ct[1], Vx * Sy - st_ct[0], Vx * Vz,
+		Vy * Sx + st_ct[0], Vy * Sy - st_ct[1], Vy * Vz,
+		Vz * Sx, Vz * Sy, 1.0f - z);
+
+	return M * pos;
+}
+
+struct flake_noise_value {	
+	// flake priority (in [0..1], 0: no flake, flakes with higher priority shadow flakes "below" them)
+	float priority;
+	// Stores values from the functions (once normal, another time the color)
+	// current pseudo random number generator seed
+	int   rnd_seed;
+	float4 carrier; 
+};
+
+// flake noise function with controllable regularity, flake size, and probability
+flake_noise_value flake_noise(
+	float3 pos,
+	float jitter_scale	  = 1.0f,
+	float flake_diameter	= 0.75f,
+	float flake_probability = 1.0f)
+{
+	float3 base_pos = ::math::floor(pos);
+	int3 base_pos_i = int3(base_pos);
+
+	// limit the flake size to the allowed maximum (such that looking at all neighbors is sufficient)
+	flake_diameter = ::math::min(flake_diameter, (1.5f - 0.5f * jitter_scale) / ::math::sqrt(3.0f));
+	
+	flake_noise_value val(0.0f, 0, float4(0.0f));
+
+	for (int i = -1; i < 2; ++i) {
+		for (int j = -1; j < 2; ++j) {
+			for (int k = -1; k < 2; ++k) {
+
+				int seed = rnd_init(base_pos_i + int3(i, j, k));
+
+				seed = rnd_next(seed);
+				if (rnd_value(seed) > flake_probability)
+					continue;
+
+				seed = rnd_next(seed);
+				float priority = rnd_value(seed);
+				if (priority < val.priority)
+					continue;				
+
+				float3 flake_pos = base_pos + float3(i, j, k) + float3(0.5f);
+
+				if (jitter_scale > 0.0f) {
+					seed = rnd_next(seed);
+					flake_pos.x += (rnd_value(seed) - 0.5f) * jitter_scale;
+					seed = rnd_next(seed);
+					flake_pos.y += (rnd_value(seed) - 0.5f) * jitter_scale;
+					seed = rnd_next(seed);
+					flake_pos.z += (rnd_value(seed) - 0.5f) * jitter_scale;
+				}
+
+				float3 p = pos - flake_pos;
+				if (::math::dot(p, p) >= flake_diameter * flake_diameter * 4.0f)
+					continue;
+
+				float3 xi_rot;
+				seed = rnd_next(seed);
+				xi_rot.x = rnd_value(seed);
+				seed = rnd_next(seed);
+				xi_rot.y = rnd_value(seed);
+				seed = rnd_next(seed);
+				xi_rot.z = rnd_value(seed);
+				p = rotate_pos(p, xi_rot);
+				
+				if (::math::abs(p.x) <= flake_diameter &&
+					::math::abs(p.y) <= flake_diameter &&
+					::math::abs(p.z) <= flake_diameter)
+				{
+					val.priority = priority;
+					val.rnd_seed = seed;
+				}
+			}
+		}
+	}
+
+	return val;
+}
+
+// create a flake normal by importance sampling the Beckmann distribution with given roughness
+flake_noise_value flake_normal(
+	flake_noise_value val,
+	float spread)
+{
+	if (val.priority <= 0.0f)
+	{
+		val.carrier = float4(::state::normal().x, ::state::normal().y, ::state::normal().z, 1.0f);
+		return val;
+	}
+	
+	int seed  = rnd_next(val.rnd_seed);
+	float xi0 = rnd_value(seed);
+	seed = rnd_next(seed);
+	float xi1 = rnd_value(seed);
+	
+	float phi = ::math::PI * 2.0f * xi0;
+
+	float roughness = spread * spread;
+
+	float tantheta = ::math::sqrt(-roughness * roughness * ::math::log(1.0f - xi1));
+	float sintheta = tantheta / ::math::sqrt(1.0f + tantheta * tantheta);
+	float costheta = ::math::sqrt(1.0f - sintheta * sintheta);
+
+	float[2] scphi = ::math::sincos(phi);
+	
+	val.rnd_seed = seed;
+
+	float3 normal = ::state::texture_tangent_u(0) * scphi[1] * sintheta +
+		::state::texture_tangent_v(0) * scphi[0] * sintheta +
+		::state::normal() * costheta;
+	
+	val.carrier = float4(normal.x, normal.y, normal.z, 1.0f);
+		
+	
+	return val;	
+}
+
+// ------------------- (Candy): 1 Orange Candy -------------------
+export material Carpaint_Candy(
+	color base_color = color(0.552011f, 0.187821f, 0.030713f) [[
+		::anno::description("Sets the base color of the carpaint"),
+		::anno::display_name("Base "),
+		::anno::in_group("Appearance"),
+		::anno::ui_order(0)
+	]],
+	float ground_coat_influence = 0.0f [[
+		::anno::description("The ground coat layer is a metallic base layer over which the base color coat, the flakes and the clearcoat are applied. Use the parameter 'Ground Coat Brightness' to adjust its brightness."),
+		::anno::display_name("Base Coat Influence"),
+		::anno::in_group("Appearance"),
+		::anno::hard_range(0.f, 1.f),
+		::anno::ui_order(1)
+	]],
+	float ground_coat_brightness = 0.45f [[
+		::anno::description("Adjusts the brightness of the metallic ground coat over which the base color coat, the flakes and the clearcoat are applied. Only has an effect, if the Ground Coat Influence is greater than 0.0"),
+		::anno::display_name("Base Coat Brightness"),
+		::anno::in_group("Appearance"),
+		::anno::hard_range(0.f, 1.f),
+		::anno::ui_order(2)
+	]],
+	float edge_darkening = 0.80f [[
+		::anno::description("The amount how much colors fade to darker color when looking at the carpaint at grazing angles. Low values make the carpaint look more flat"),
+		::anno::display_name("Edge Darkening"),
+		::anno::in_group("Appearance"),
+		::anno::hard_range(0.f, 1.f),
+		::anno::ui_order(3)
+	]],
+	color flakes_tint = color(0.672443f, 0.181164f, 0.012983f) [[
+		::anno::description("The color of the flakes"),
+		::anno::display_name("Flakes Tint"),
+		::anno::in_group("Flakes"),
+		::anno::ui_order(4)
+	]],
+	uniform float flakes_density = 0.31f [[
+		::anno::description("Adjusts the density of the flakes. Lower number means less flake particles being applied."),
+		::anno::display_name("Flakes Density"),
+		::anno::in_group("Flakes"),
+		::anno::hard_range(0.f, 1.f),
+		::anno::ui_order(5)
+	]],
+	float spread = 0.54f [[
+		::anno::description("The amount how much flakes are pointing to random directions. It is strongly discouraged using a value of 0.0 as the flakes will be oriented exactly as the surface normal, which will result in an unnatural look. Higher values lead to a more scintillating look of the flakes."),
+		::anno::display_name("Flakes Spread"),
+		::anno::enable_if("flakes_density > 0.0f"),
+		::anno::in_group("Flakes"),
+		::anno::hard_range(0.f, 1.f),
+		::anno::ui_order(6)
+	]],
+	float flakes_roughness = 0.15f [[
+		::anno::description("The roughness of the flakes itself. Higher values smoothen out the look of the flakes. Depending on the flakes being used in carpaints, use low values for a sparkling flake effect while mica flakes tend to have a higher roughness, leading to a smoother more pearlescent look on the final carpaint"),
+		::anno::display_name("Flakes Roughness"),
+		::anno::enable_if("flakes_density > 0.0f"),
+		::anno::in_group("Flakes"),
+		::anno::hard_range(0.f, 1.f),
+		::anno::ui_order(7)
+	]],
+	float flakes_size = 0.6f [[
+		::anno::description("Size of the metal flakes in millimeters."),
+		::anno::display_name("Flakes Size (mm)"),
+		::anno::enable_if("flakes_density > 0.0f"),
+		::anno::soft_range(0.f, 1.f),
+		::anno::in_group("Flakes"),
+		::anno::ui_order(8)
+	]],
+	float candy_flip = 0.82f [[
+		::anno::description("Changes the tint of the coating to fade towards the flake color to produce a candy paint effect. "),
+		::anno::display_name("Candy Coating"),
+		::anno::in_group("Flakes"),
+		::anno::hard_range(0.f, 1.f),
+		::anno::ui_order(9)
+	]],
+	float flake_layer_visibility = 0.99f [[
+		::anno::description("Adjusts how much the flakes contribute to the final look. Lowering the value makes the flakes appear more transparent. At value of 0.0 no flakes are not rendered at all"),
+		::anno::display_name("Flakes Visibility"),
+		::anno::enable_if("flakes_density > 0.0f"),
+		::anno::in_group("Flakes"),
+		::anno::hard_range(0.f, 1.f),
+		::anno::ui_order(10)
+	]],
+	uniform texture_2d roughness_texture = texture_2d("./textures/smudges_scratches_A_rough.jpg", ::tex::gamma_linear) [[
+		::anno::description("Texture to use for adding variation to the roughness on the clearcoat"),
+		::anno::display_name("Roughness Texture"),
+		::anno::in_group("Clearcoat"),
+		::anno::ui_order(11)
+	]],
+	float clearcoat_rough = 0.06f [[
+		::anno::description("The roughness of the clearcoat"),
+		::anno::display_name("Clearcoat Roughness"),
+		::anno::in_group("Clearcoat"),
+		::anno::hard_range(0.f, 1.f),
+		::anno::ui_order(12)
+	]],
+	float roughness_variation = 0.14f [[
+		::anno::description("The amount of variation to apply to the roughness. This parameter only has an effect when the clearcoat roughness is not zero or one"),
+		::anno::display_name("Clearcoat Roughness Variation"),
+		::anno::in_group("Clearcoat"),
+		::anno::hard_range(0.f, 1.f),
+		::anno::ui_order(13)
+	]],
+	float clearcoat_ior = 1.600f [[
+		::anno::description("The index of refraction for the clearcoat layer"),
+		::anno::display_name("Clearcoat Index of Refraction"),
+		::anno::in_group("Clearcoat"),
+		::anno::soft_range(1.f, 3.f),
+		::anno::hard_range(1.f, 5.f),
+		::anno::ui_order(14)
+	]],
+	float clearcoat_visibility = 1.f [[
+		::anno::description("While the full value is the correct physical behavior of the clearcoat, lowering the value to reduce the amount of reflection for artistic purposes"),
+		::anno::display_name("Clearcoat Visibility"),
+		::anno::in_group("Clearcoat"),
+		::anno::hard_range(0.f, 1.f),
+		::anno::ui_order(15)
+	]],
+	uniform float orange_peel_strength = 0.f [[
+		::anno::description("Strength of the bump mapping effect"),
+		::anno::display_name("Coat Orange Peel Strength"),
+		::anno::in_group("Clearcoat"),
+		::anno::soft_range(0.f, 1.f),
+		::anno::hard_range(0.f, 2.f),
+		::anno::ui_order(16)
+	]],
+	uniform float orange_peel_size = 0.1f [[
+		::anno::description("Size of the biggest feature of the pattern"),
+		::anno::display_name("Coat Orange Peel Size"),
+		::anno::soft_range(0.f, 1.f),
+		::anno::in_group("Clearcoat"),
+		::anno::ui_order(17)
+	]],
+	float2 texture_translate = float2(0.f) [[
+		::anno::description("Controls the position of the texture"),
+		::anno::display_name("Texture Translate"),
+		::anno::in_group("Transform"),
+		::anno::ui_order(18)
+	]],
+	float texture_rotate = 0.f [[
+		::anno::description("Rotates angle of the texture in degrees"),
+		::anno::display_name("Texture Rotate"),
+		::anno::in_group("Transform"),
+		::anno::soft_range(0.f, 360.f),
+		::anno::ui_order(19)
+	]],
+	float2 texture_scale = float2(1.f) [[
+		::anno::description("Larger numbers increase the size"),
+		::anno::display_name("Texture Scale"),
+		::anno::in_group("Transform"),
+		::nvidia::core_definitions::dimension(float2(1.f, 1.f)),
+		::anno::ui_order(20)
+	]],
+	uniform bool roundcorners_enable = false [[
+		::anno::description("Enables the round corneer effect. Comes at a slight performance cost as additional raytracing calls are rquired to evaluate the round corner effect"),
+		::anno::display_name("Enable Round Corners"),
+		::anno::in_group("Round Corners"),
+		::anno::ui_order(22)
+	]],
+	uniform float roundcorners_radius_mm = 1.5f [[
+		::anno::description("Radius of the rounded corners in millimeters"),
+		::anno::display_name("Round Corner Radius (mm)"),
+		::anno::in_group("Round Corners"),
+		::anno::soft_range(0.f, 10.f),
+		::anno::ui_order(23)
+	]],
+	uniform bool roundcorners_across_materials = false [[
+		::anno::description("Applies the round corner effect across different materials when enabled"),
+		::anno::display_name("Across Materials"),
+		::anno::in_group("Round Corners"),
+		::anno::ui_order(27)
+	]],
+	uniform int uv_space_index = 0 [[
+		::anno::description("Use selected UV space for material."),
+		::anno::display_name("UV Space Index"),
+		::anno::in_group("Advanced"),
+		::anno::ui_order(28)
+	]]
+
+)
+[[
+	::anno::author("NVIDIA"),
+	::anno::display_name("Carpaint Candy - Orange Candy"),
+	::anno::description("Multilayered carpaint material with metallic flakes"),
+	::anno::key_words(string[]("carpaint", "reflective", "artificial", "multilayer", "new", "flat", "clearcoat", "automotive", "design", "metallic", "flakes", "candy", "pigment", "glitter", "orange", "warm", "saturated")),
+	::anno::thumbnail("./.thumbs/Carpaint_Candy.Carpaint_Candy.png"),
+	::anno::copyright_notice(COPYRIGHT)
+]]
+ = 
+	let {
+		bool tmp0 = false;
+		// Tried Scaling factors for flakes to fit 1mm  size both in Substance Designer and (Iray for) Rhino
+		// Rhino scaling factor: 				1492.537313432835
+		// Substance Designer Scaling factor:	1158.6829010512
+		float flakes_size_m = (1492.537313432835f/flakes_size); // Flake scaling adjustment, so that flake size is in mm
+		float flake_layer_visibility_m = 1.0f - flake_layer_visibility;
+		
+		::base::texture_coordinate_info coord_info = ::base::coordinate_source(::base::texture_coordinate_object, 0);
+		
+		float scale_trans = ::state::transform_scale(::state::coordinate_object, ::state::coordinate_world, 1.0f);
+		
+		float3 source_coord = coord_info.position * ::state::meters_per_scene_unit() * scale_trans;
+		
+		::base::texture_coordinate_info transformed_coord = ::base::transform_coordinate(
+			::base::rotation_translation_scale(float3(0.0f), float3(0.0f), float3(scale_trans)),
+			coord_info
+		);
+		
+		material_surface tmp1(::df::fresnel_layer(clearcoat_ior, clearcoat_visibility, ::df::simple_glossy_bsdf(histogram_range(::base::file_texture(roughness_texture, color(0.f, 0.f, 0.f), color(1.f, 1.f, 1.f), ::base::mono_average, vmat_transform(texture_translate, texture_rotate, texture_scale, ::base::texture_coordinate_uvw, uv_space_index), float2(0.f, 1.f), float2(0.f, 1.f), ::tex::wrap_repeat, ::tex::wrap_repeat, false).mono, roughness_variation, clearcoat_rough) * histogram_range(::base::file_texture(roughness_texture, color(0.f, 0.f, 0.f), color(1.f, 1.f, 1.f), ::base::mono_average, vmat_transform(texture_translate, texture_rotate, texture_scale, ::base::texture_coordinate_uvw, uv_space_index), float2(0.f, 1.f), float2(0.f, 1.f), ::tex::wrap_repeat, ::tex::wrap_repeat, false).mono, roughness_variation, clearcoat_rough), histogram_range(::base::file_texture(roughness_texture, color(0.f, 0.f, 0.f), color(1.f, 1.f, 1.f), ::base::mono_average, vmat_transform(texture_translate, texture_rotate, texture_scale, ::base::texture_coordinate_uvw, uv_space_index), float2(0.f, 1.f), float2(0.f, 1.f), ::tex::wrap_repeat, ::tex::wrap_repeat, false).mono, roughness_variation, clearcoat_rough) * histogram_range(::base::file_texture(roughness_texture, color(0.f, 0.f, 0.f), color(1.f, 1.f, 1.f), ::base::mono_average, vmat_transform(texture_translate, texture_rotate, texture_scale, ::base::texture_coordinate_uvw, uv_space_index), float2(0.f, 1.f), float2(0.f, 1.f), ::tex::wrap_repeat, ::tex::wrap_repeat, false).mono, roughness_variation, clearcoat_rough), nvidia::core_definitions::blend_colors(color(1.f, 1.f, 1.f), flakes_tint, ::base::color_layer_blend, candy_flip).tint, nvidia::core_definitions::blend_colors(color(1.f, 1.f, 1.f), flakes_tint, ::base::color_layer_blend, candy_flip).tint, ::state::texture_tangent_u(0), ::df::scatter_reflect), ::df::directional_factor(color(1.f, 1.f, 1.f), color(1.f - edge_darkening), 1.f, flakes_density > 0.f ? ::df::weighted_layer(::math::lerp(flake_noise(source_coord * flakes_size_m, 0.5f, 1.f, flakes_density * flakes_density).priority > 0.001f ? 1.0f : 0.0f , 0.f, flake_layer_visibility_m), ::df::microfacet_ggx_smith_bsdf(flakes_roughness * 0.340000004f, flakes_roughness * 0.340000004f, flakes_tint, color(0.f, 0.f, 0.f), ::state::texture_tangent_u(0), ::df::scatter_reflect), ::df::directional_factor(base_color, color(1.f - edge_darkening), 1.f, ::df::weighted_layer(ground_coat_influence * 0.5f, ::df::microfacet_ggx_vcavities_bsdf(0.40959999f, 0.40959999f, color(ground_coat_brightness * 0.949999988f + 0.0500000007f), color(ground_coat_brightness * 0.949999988f + 0.0500000007f), ::state::texture_tangent_u(0), ::df::scatter_reflect), ::df::diffuse_reflection_bsdf(base_color, 0.f), ::state::normal())), float3(flake_normal(flake_noise(source_coord * flakes_size_m, 0.5f, 1.f, flakes_density * flakes_density ), spread).carrier.x, flake_normal(flake_noise(source_coord * flakes_size_m, 0.5f, 1.f, flakes_density * flakes_density ), spread).carrier.y, flake_normal(flake_noise(source_coord * flakes_size_m, 0.5f, 1.f, flakes_density * flakes_density ), spread).carrier.z)) : ::df::directional_factor(base_color, color(1.f - edge_darkening), 1.f, ::df::weighted_layer(ground_coat_influence * 0.5f, ::df::microfacet_ggx_vcavities_bsdf(0.40959999f, 0.40959999f, color(ground_coat_brightness * 0.949999988f + 0.0500000007f), color(ground_coat_brightness * 0.949999988f + 0.0500000007f), ::state::texture_tangent_u(0), ::df::scatter_reflect), ::df::diffuse_reflection_bsdf(base_color, 0.f), ::state::normal()))), orange_peel_strength > 0.f ? ::base::perlin_noise_bump_texture(transformed_coord, orange_peel_strength, orange_peel_size, false, false, 0.f, 2, false, false, float3(0.f), 1.f, 0.f, 1.f, ::state::normal()) : ::state::normal()), material_emission(emission: edf(), intensity: color(0.f, 0.f, 0.f), mode: intensity_radiant_exitance));
+		material_surface tmp2 = material_surface(scattering: bsdf(), emission: material_emission(emission: edf(), intensity: color(0.f, 0.f, 0.f), mode: intensity_radiant_exitance));
+		color tmp3 = color(1.f, 1.f, 1.f);
+		material_volume tmp4 = material_volume(scattering: vdf(), absorption_coefficient: color(0.f, 0.f, 0.f), scattering_coefficient: color(0.f, 0.f, 0.f));
+		material_geometry tmp5(float3(0.f), 1.f, roundcorners_enable ? ::state::rounded_corner_normal(roundcorners_radius_mm * 0.00100000005f, roundcorners_across_materials, 1.f) : ::state::normal());
+		hair_bsdf tmp6 = hair_bsdf();
+	} in
+		material(
+			thin_walled: tmp0,
+			surface: tmp1,
+			backface: tmp2,
+			ior: tmp3,
+			volume: tmp4,
+			geometry: tmp5,
+			hair: tmp6);
+
+
+// ------------------- (Candy): 2 Black Monster Flakes -------------------
+export material Black_Monster_Flakes_Candy(*)
+[[
+	::anno::author("NVIDIA"),
+	::anno::display_name("Carpaint Candy - Black Monster Flakes"),
+	::anno::description("Multilayered carpaint material with metallic flakes"),
+	::anno::key_words(string[]("carpaint", "reflective", "artificial", "multilayer", "new", "flat", "clearcoat", "automotive", "design", "metallic", "flakes", "candy", "pigment", "glitter", "black", "dark", "neutral")),
+	::anno::thumbnail("./.thumbs/Carpaint_Candy.Black_Monster_Flakes_Candy.png"),
+	::anno::copyright_notice(COPYRIGHT)
+]]
+ = Carpaint_Candy(
+	base_color:				color(0.019382f, 0.019382f, 0.019382f),
+	ground_coat_influence:	0.00f,
+	ground_coat_brightness:	0.34f,
+	edge_darkening:			0.57f,
+	flakes_tint:			color(0.730461f, 0.730461f, 0.730461f),
+	flakes_density:			0.16f,
+	spread:					0.52f,
+	flakes_roughness:		0.19f,
+	flakes_size:			0.8f,
+	candy_flip:				0.00f,
+	flake_layer_visibility: 0.82f,
+	// roughness_texture:		
+	clearcoat_rough:		0.06f,	
+	roughness_variation:	0.14f,
+	clearcoat_ior:			1.6f,
+	clearcoat_visibility:	1.0f,
+	orange_peel_strength:	0.00f,
+	orange_peel_size:		0.01f
+);
+
+// ------------------- (Candy): 3 Red Candy Coat -------------------
+export material Red_Candy_Coat(*)
+[[
+	::anno::author("NVIDIA"),
+	::anno::display_name("Carpaint Candy - Red Candy"),
+	::anno::description("Multilayered carpaint material with metallic flakes"),
+	::anno::key_words(string[]("carpaint", "reflective", "artificial", "multilayer", "new", "flat", "clearcoat", "automotive", "design", "metallic", "flakes", "candy", "pigment", "glitter", "red", "warm", "saturated")),
+	::anno::thumbnail("./.thumbs/Carpaint_Candy.Red_Candy_Coat.png"),
+	::anno::copyright_notice(COPYRIGHT)
+]]
+ = Carpaint_Candy(
+	base_color:				color(0.124772f, 0.021219f, 0.021219f),
+	ground_coat_influence:	0.43f,
+	ground_coat_brightness:	0.24f,
+	edge_darkening:			0.64f,
+	flakes_tint:			color(0.318547f, 0.021219f, 0.021219f),
+	flakes_density:			0.79f,
+	spread:					0.27f,
+	flakes_roughness:		0.14f,
+	flakes_size:			0.8f,
+	candy_flip:				0.82f,
+	flake_layer_visibility: 0.99f,
+	// roughness_texture:		
+	clearcoat_rough:		0.06f,	
+	roughness_variation:	0.14f,
+	clearcoat_ior:			1.6f,
+	clearcoat_visibility:	1.0f,
+	orange_peel_strength:	0.00f,
+	orange_peel_size:		0.01f
+);
+
+// ------------------- (Candy): 4 Red Murdered Candy -------------------
+export material Red_Murdered_Candy_Coat(*)
+[[
+	::anno::author("NVIDIA"),
+	::anno::display_name("Carpaint Candy - Red Murdered Candy"),
+	::anno::description("Multilayered carpaint material with metallic flakes"),
+	::anno::key_words(string[]("carpaint", "reflective", "artificial", "multilayer", "new", "flat", "clearcoat", "automotive", "design", "metallic", "flakes", "candy", "pigment", "glitter", "red", "warm", "saturated", "dark")),
+	::anno::thumbnail("./.thumbs/Carpaint_Candy.Red_Murdered_Candy_Coat.png"),
+	::anno::copyright_notice(COPYRIGHT)
+]]
+ = Carpaint_Candy(
+	base_color:				color(0.021219f, 0.021219f, 0.021219f),
+	ground_coat_influence:	0.00f,
+	ground_coat_brightness:	0.38f,
+	edge_darkening:			0.57f,
+	flakes_tint:			color(0.783538f, 0.014444f, 0.039546f),
+	flakes_density:			0.20f,
+	spread:					0.13f,
+	flakes_roughness:		0.12f,
+	flakes_size:			0.8f,
+	candy_flip:				0.53f,
+	flake_layer_visibility: 0.52f,
+	// roughness_texture:		
+	clearcoat_rough:		0.06f,	
+	roughness_variation:	0.14f,
+	clearcoat_ior:			1.6f,
+	clearcoat_visibility:	1.0f,
+	orange_peel_strength:	0.00f,
+	orange_peel_size:		0.01f
+);
+
+// ------------------- (Candy): 5 Orange Murdered Candy -------------------
+export material Orange_Murdered_Candy_Coat(*)
+[[
+	::anno::author("NVIDIA"),
+	::anno::display_name("Carpaint Candy - Orange Murdered Candy"),
+	::anno::description("Multilayered carpaint material with metallic flakes"),
+	::anno::key_words(string[]("carpaint", "reflective", "artificial", "multilayer", "new", "flat", "clearcoat", "automotive", "design", "metallic", "flakes", "candy", "pigment", "glitter", "orange", "warm", "saturated", "dark")),
+	::anno::thumbnail("./.thumbs/Carpaint_Candy.Orange_Murdered_Candy_Coat.png"),
+	::anno::copyright_notice(COPYRIGHT)
+]]
+ = Carpaint_Candy(
+	base_color:				color(0.054480f, 0.028426f, 0.026241f),
+	ground_coat_influence:	1.0f,
+	ground_coat_brightness:	0.00f,
+	edge_darkening:			1.00f,
+	flakes_tint:			color(0.723055f, 0.191202f, 0.020289f),
+	flakes_density:			0.27f,
+	spread:					0.22f,
+	flakes_roughness:		0.31f,
+	flakes_size:			0.8f,
+	candy_flip:				0.68f,
+	flake_layer_visibility: 0.99f,
+	// roughness_texture:		
+	clearcoat_rough:		0.06f,	
+	roughness_variation:	0.14f,
+	clearcoat_ior:			1.6f,
+	clearcoat_visibility:	1.0f,
+	orange_peel_strength:	0.00f,
+	orange_peel_size:		0.01f
+);
+
+
+// ------------------- (Candy): 6 Yellow Candy -------------------
+export material Yellow_Candy_Coat(*)
+[[
+	::anno::author("NVIDIA"),
+	::anno::display_name("Carpaint Candy - Yellow Candy"),
+	::anno::description("Multilayered carpaint material with metallic flakes"),
+	::anno::key_words(string[]("carpaint", "reflective", "artificial", "multilayer", "new", "flat", "clearcoat", "automotive", "design", "metallic", "flakes", "candy", "pigment", "glitter", "yellow", "warm", "saturated", "light")),
+	::anno::thumbnail("./.thumbs/Carpaint_Candy.Yellow_Candy_Coat.png"),
+	::anno::copyright_notice(COPYRIGHT)
+]]
+ = Carpaint_Candy(
+	base_color:				color(0.610496f, 0.445201f, 0.025187f),
+	ground_coat_influence:	0.78f,
+	ground_coat_brightness:	1.00f,
+	edge_darkening:			1.00f,
+	flakes_tint:			color(0.871367f, 0.450786f, 0.052861f),
+	flakes_density:			0.51f,
+	spread:					0.54f,
+	flakes_roughness:		0.37f,
+	flakes_size:			0.60f,
+	candy_flip:				0.75f,
+	flake_layer_visibility: 0.99f,
+	// roughness_texture:		
+	clearcoat_rough:		0.06f,	
+	roughness_variation:	0.14f,
+	clearcoat_ior:			1.6f,
+	clearcoat_visibility:	1.0f,
+	orange_peel_strength:	0.00f,
+	orange_peel_size:		0.01f
+);
+
+
+// ------------------- (Candy): 7 Green Candy -------------------
+export material Green_Candy_Coat(*)
+[[
+	::anno::author("NVIDIA"),
+	::anno::display_name("Carpaint Candy - Green Candy"),
+	::anno::description("Multilayered carpaint material with metallic flakes"),
+	::anno::key_words(string[]("carpaint", "reflective", "artificial", "multilayer", "new", "flat", "clearcoat", "automotive", "design", "metallic", "flakes", "candy", "pigment", "glitter", "green", "saturated")),
+	::anno::thumbnail("./.thumbs/Carpaint_Candy.Green_Candy_Coat.png"),
+	::anno::copyright_notice(COPYRIGHT)
+]]
+ = Carpaint_Candy(
+	base_color:				color(0.109462f, 0.527115f, 0.246201f),
+	ground_coat_influence:	1.00f,
+	ground_coat_brightness:	0.75f,
+	edge_darkening:			1.00f,
+	flakes_tint:			color(0.102242f, 0.571125f, 0.318547f),
+	flakes_density:			0.39f,
+	spread:					0.38f,
+	flakes_roughness:		0.20f,
+	flakes_size:			0.60f,
+	candy_flip:				0.77f,
+	flake_layer_visibility: 0.99f,
+	// roughness_texture:		
+	clearcoat_rough:		0.06f,	
+	roughness_variation:	0.14f,
+	clearcoat_ior:			1.6f,
+	clearcoat_visibility:	1.0f,
+	orange_peel_strength:	0.00f,
+	orange_peel_size:		0.01f
+);
+
+
+// ------------------- (Candy): 8 Green Murdered Candy -------------------
+export material Green_Murdered_Candy_Coat(*)
+[[
+	::anno::author("NVIDIA"),
+	::anno::display_name("Carpaint Candy - Green Murdered Candy"),
+	::anno::description("Multilayered carpaint material with metallic flakes"),
+	::anno::key_words(string[]("carpaint", "reflective", "artificial", "multilayer", "new", "flat", "clearcoat", "automotive", "design", "metallic", "flakes", "candy", "pigment", "glitter", "green", "saturated", "dark")),
+	::anno::thumbnail("./.thumbs/Carpaint_Candy.Green_Murdered_Candy_Coat.png"),
+	::anno::copyright_notice(COPYRIGHT)
+]]
+ = Carpaint_Candy(
+	base_color:				color(0.021219f, 0.024158f, 0.021219f),
+	ground_coat_influence:	0.64f,
+	ground_coat_brightness:	0.38f,
+	edge_darkening:			0.57f,
+	flakes_tint:			color(0.107023f, 0.423268f, 0.072272f),
+	flakes_density:			0.22f,
+	spread:					0.23f,
+	flakes_roughness:		0.13f,
+	flakes_size:			0.6f,
+	candy_flip:				0.78f,
+	flake_layer_visibility: 0.6f,
+	// roughness_texture:		
+	clearcoat_rough:		0.06f,	
+	roughness_variation:	0.14f,
+	clearcoat_ior:			1.6f,
+	clearcoat_visibility:	1.0f,
+	orange_peel_strength:	0.00f,
+	orange_peel_size:		0.01f
+);
+
+// ------------------- (Candy): 9 Intense Blue -------------------
+export material Blue_Intense_Candy_Coat(*)
+[[
+	::anno::author("NVIDIA"),
+	::anno::display_name("Carpaint Candy - Blue Intense Candy"),
+	::anno::description("Multilayered carpaint material with metallic flakes"),
+	::anno::key_words(string[]("carpaint", "reflective", "artificial", "multilayer", "new", "flat", "clearcoat", "automotive", "design", "metallic", "flakes", "candy", "pigment", "glitter", "blue", "saturated", "dark", "intense", "cool")),
+	::anno::thumbnail("./.thumbs/Carpaint_Candy.Blue_Intense_Candy_Coat.png"),
+	::anno::copyright_notice(COPYRIGHT)
+]]
+ = Carpaint_Candy(
+	base_color:				color(0.021219f, 0.023153f, 0.242281f),
+	ground_coat_influence:	0.84f,
+	ground_coat_brightness:	0.38f,
+	edge_darkening:			1.00f,
+	flakes_tint:			color(0.033105f, 0.116971f, 0.871367f),
+	flakes_density:			0.31f,
+	spread:					0.23f,
+	flakes_roughness:		0.24f,
+	flakes_size:			0.60f,
+	candy_flip:				0.88f,
+	flake_layer_visibility: 0.99f,
+	// roughness_texture:		
+	clearcoat_rough:		0.06f,	
+	roughness_variation:	0.14f,
+	clearcoat_ior:			1.6f,
+	clearcoat_visibility:	1.0f,
+	orange_peel_strength:	0.00f,
+	orange_peel_size:		0.01f
+);
+
+// ------------------- (Candy): 10 Blue Murdered Candy -------------------
+export material Blue_Murdered_Candy_Coat(*)
+[[
+	::anno::author("NVIDIA"),
+	::anno::display_name("Carpaint Candy - Blue Murdered Candy"),
+	::anno::description("Multilayered carpaint material with metallic flakes"),
+	::anno::key_words(string[]("carpaint", "reflective", "artificial", "multilayer", "new", "flat", "clearcoat", "automotive", "design", "metallic", "flakes", "candy", "pigment", "glitter", "green", "saturated", "dark", "cool")),
+	::anno::thumbnail("./.thumbs/Carpaint_Candy.Blue_Murdered_Candy_Coat.png"),
+	::anno::copyright_notice(COPYRIGHT)
+]]
+ = Carpaint_Candy(
+	base_color:				color(0.021219f, 0.021219f, 0.023153f),
+	ground_coat_influence:	0.64f,
+	ground_coat_brightness:	0.38f,
+	edge_darkening:			0.57f,
+	flakes_tint:			color(0.059511f, 0.144128f, 0.337164f),
+	flakes_density:			0.31f,
+	spread:					0.23f,
+	flakes_roughness:		0.23f,
+	flakes_size:			0.6f,
+	candy_flip:				0.68f,
+	flake_layer_visibility: 1.00f,
+	// roughness_texture:		
+	clearcoat_rough:		0.06f,	
+	roughness_variation:	0.14f,
+	clearcoat_ior:			1.6f,
+	clearcoat_visibility:	1.0f,
+	orange_peel_strength:	0.00f,
+	orange_peel_size:		0.01f
+);
+
+
+// ------------------- (Candy): 11 Purple Candy Madness -------------------
+export material Purple_Candy_Madness(*)
+[[
+	::anno::author("NVIDIA"),
+	::anno::display_name("Carpaint Candy - Blue Purple Candy Madness"),
+	::anno::description("Multilayered carpaint material with metallic flakes"),
+	::anno::key_words(string[]("carpaint", "reflective", "artificial", "multilayer", "new", "flat", "clearcoat", "automotive", "design", "metallic", "flakes", "candy", "pigment", "glitter", "purple", "saturated", "intense")),
+	::anno::thumbnail("./.thumbs/Carpaint_Candy.Purple_Candy_Madness.png"),
+	::anno::copyright_notice(COPYRIGHT)
+]]
+ = Carpaint_Candy(
+	base_color:				color(0.341914f, 0.019382f, 0.230740f),
+	ground_coat_influence:	0.97f,
+	ground_coat_brightness:	0.41f,
+	edge_darkening:			0.59f,
+	flakes_tint:			color(0.552011f, 0.086500f, 0.3419147f),
+	flakes_density:			0.26f,
+	spread:					0.67f,
+	flakes_roughness:		0.36f,
+	flakes_size:			0.60f,
+	candy_flip:				0.85f,
+	flake_layer_visibility: 0.82f,
+	// roughness_texture:		
+	clearcoat_rough:		0.06f,	
+	roughness_variation:	0.14f,
+	clearcoat_ior:			1.6f,
+	clearcoat_visibility:	1.0f,
+	orange_peel_strength:	0.00f,
+	orange_peel_size:		0.01f
+);
+
+// ------------------- (Candy): 12 Purple Monster Flakes -------------------
+export material Purple_Monster_Flakes(*)
+[[
+	::anno::author("NVIDIA"),
+	::anno::display_name("Carpaint Candy - Purple Monster Flakes"),
+	::anno::description("Multilayered carpaint material with metallic flakes"),
+	::anno::key_words(string[]("carpaint", "reflective", "artificial", "multilayer", "new", "flat", "clearcoat", "automotive", "design", "metallic", "flakes", "candy", "pigment", "glitter", "purple", "saturated", "intense")),
+	::anno::thumbnail("./.thumbs/Carpaint_Candy.Purple_Monster_Flakes.png"),
+	::anno::copyright_notice(COPYRIGHT)
+]]
+ = Carpaint_Candy(
+	base_color:				color(0.124772f, 0.006995f, 0.049707f),
+	ground_coat_influence:	0.43f,
+	ground_coat_brightness:	0.24f,
+	edge_darkening:			0.84f,
+	flakes_tint:			color(0.783538f, 0.059511f, 0.597202f),
+	flakes_density:			0.3f,
+	spread:					0.44f,
+	flakes_roughness:		0.11f,
+	flakes_size:			0.60f,
+	candy_flip:				0.77f,
+	flake_layer_visibility: 1.00f,
+	// roughness_texture:		
+	clearcoat_rough:		0.06f,	
+	roughness_variation:	0.14f,
+	clearcoat_ior:			1.6f,
+	clearcoat_visibility:	1.0f,
+	orange_peel_strength:	0.00f,
+	orange_peel_size:		0.01f
+);
+
+// ------------------- (Candy): 13 Pinkie Pie -------------------
+export material Pinkie_Pie(*)
+[[
+	::anno::author("NVIDIA"),
+	::anno::display_name("Carpaint Candy - Pinkie Pie"),
+	::anno::description("Multilayered carpaint material with metallic flakes"),
+	::anno::key_words(string[]("carpaint", "reflective", "artificial", "multilayer", "new", "flat", "clearcoat", "automotive", "design", "metallic", "flakes", "candy", "pigment", "glitter", "pink", "saturated", "warm")),
+	::anno::thumbnail("./.thumbs/Carpaint_Candy.Pinkie_Pie.png"),
+	::anno::copyright_notice(COPYRIGHT)
+]]
+ = Carpaint_Candy(
+	base_color:				color(0.341914f, 0.019382f, 0.230740f),
+	ground_coat_influence:	0.97f,
+	ground_coat_brightness:	0.41f,
+	edge_darkening:			0.64f,
+	flakes_tint:			color(0.491021f, 0.119538f, 0.332452f),
+	flakes_density:			0.74f,
+	spread:					0.53f,
+	flakes_roughness:		0.53f,
+	flakes_size:			0.50f,
+	candy_flip:				0.87f,
+	flake_layer_visibility: 0.82f,
+	// roughness_texture:		
+	clearcoat_rough:		0.06f,	
+	roughness_variation:	0.14f,
+	clearcoat_ior:			1.6f,
+	clearcoat_visibility:	1.0f,
+	orange_peel_strength:	0.00f,
+	orange_peel_size:		0.01f
+);
+
+
+
+
+
+
+
+
+
+
+
