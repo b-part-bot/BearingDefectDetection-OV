@@ -2,10 +2,12 @@
 
 ## Contents
 
-- [Ball Bearings Dataset](#ball-bearings-dataset)
-- [Annotation Scripts](#annotation-scripts)
-- [YoloNAS Model Training](#yolonas-model-training)
+- [Ball Bearings Dataset](https://app.roboflow.com/bearingfault/bearing-defect-1/5)
+- [CAD_model_Bearing.usd](https://github.com/b-part-bot/BearingDefectDetection-OV/blob/main/current_models/bearing_retainer.usd)
+- [Annotation Scripts](https://github.com/b-part-bot/BearingDefectDetection-OV/blob/main/annotation%20scripts/export_script.py)
+- [YoloNAS Model Training](https://github.com/b-part-bot/BearingDefectDetection-OV/blob/main/Model%20Training/YOLO_nas.ipynb)
 - [Prediction Results](#prediction-results)
+
 
 ## Ball Bearings Dataset
 
